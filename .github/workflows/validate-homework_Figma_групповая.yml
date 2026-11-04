@@ -1,0 +1,198 @@
+name: Проверка командной сдачи Figma-практики
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: figma-team-homework-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Валидация структуры, состава и документации
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Получение кода Pull Request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Анализ структуры папок и контента
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_SIZE_BYTES: "5242880" # 5 MB
+        run: |
+          set -uo pipefail
+          export LC_ALL=C.UTF-8
+          git config core.quotepath off
+
+          errors=0
+          report=""
+
+          err() { errors=$((errors+1)); echo "::error::$1"; report+="❌ $1"$'\n'; }
+          ok()  { echo "✅ $1"; report+="✅ $1"$'\n'; }
+
+          # 1. Сбор измененных файлов в PR
+          if ! git fetch --no-tags --quiet origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"; then
+            echo "::error::Не удалось получить целевую ветку '${BASE_REF}'."
+            exit 1
+          fi
+
+          changed_files=()
+          while IFS= read -r -d '' f; do changed_files+=("$f"); done \
+            < <(git diff --name-only -z --diff-filter=ACMR "origin/${BASE_REF}...HEAD")
+
+          if [ ${#changed_files[@]} -eq 0 ]; then
+            err "В Pull Request отсутствуют измененные файлы."
+            exit 1
+          fi
+
+          # 2. Определение целевой папки команды
+          DIR=""
+          for f in "${changed_files[@]}"; do
+            [[ "$f" == .github/* ]] && continue
+            top="${f%%/*}"
+            if [[ "$top" == "Yarahovich_team" || "$top" == "Korzun_team" ]]; then
+              DIR="$top"
+              break
+            else
+              err "Обнаружен файл вне командной папки: $f. Все файлы должны находиться внутри Yarahovich_team/ или Korzun_team/."
+            fi
+          done
+
+          if [ -z "$DIR" ]; then
+            err "Не найдена целевая рабочая директория команды (Yarahovich_team/ или Korzun_team/)."
+            exit 1
+          else
+            ok "Идентификация папки успешна: Папка команды -> $DIR/"
+          fi
+
+          # 3. Валидация файла README.md и динамический подсчет состава
+          README="$DIR/README.md"
+          if [ ! -f "$README" ]; then
+            err "Отсутствует обязательный файл манифеста: $README"
+          else
+            # Проверяем, что в README.md внесли изменения (стерли заглушки)
+            if grep -qE '\[Студент|\[Вставьте|\[Укажите' "$README"; then
+              err "В файле $README остались незаполненные заглушки в квадратных скобках."
+            else
+              ok "Файл $README отредактирован студентами."
+            fi
+
+            # Проверка ссылки на Figma
+            if grep -qiE 'https?://([a-z0-9-]+\.)?figma\.com/' "$README"; then
+              ok "Ссылка на Figma-проект задекларирована."
+            else
+              err "В $README не найдена валидная ссылка на Figma (https://figma.com...)."
+            fi
+
+            # Считаем количество участников по запятым в строке "Участники:"
+            members_line="$(grep -m1 -E 'Участники:' "$README" || true)"
+            if [ -z "$members_line" ]; then
+              err "В README.md отсутствует обязательная строка «**Участники:** ...»"
+            else
+              clean_line=$(printf '%s' "$members_line" | sed 's/\*\*Участники:\*\*//g' | tr -d '*_`' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              team_size=$(printf '%s' "$clean_line" | tr ',;' '\n\n' | awk 'NF{n++} END{print n+0}')
+              
+              ok "Количество зафиксированных студентов в команде: $team_size"
+
+              # Валидация связки "Папка — Состав — Командный уровень"
+              if [[ "$DIR" == "Yarahovich_team" ]]; then
+                if [ "$team_size" -ne 3 ]; then
+                  err "Для Yarahovich_team (уровень PRO) в команде должно быть ровно 3 человека. Найдено: $team_size."
+                else
+                  if grep -q "Уровень:.*PRO" "$README"; then
+                    ok "Папка Yarahovich_team успешно прошла проверку на состав (3 человека) и уровень PRO."
+                  else
+                    err "Для Yarahovich_team в README.md должен быть явно указан «Уровень: PRO»."
+                  fi
+                fi
+              elif [[ "$DIR" == "Korzun_team" ]]; then
+                if [ "$team_size" -ne 2 ]; then
+                  err "Для Korzun_team (уровень JUNIOR) в команде должно быть ровно 2 человека. Найдено: $team_size."
+                else
+                  if grep -q "Уровень:.*JUNIOR" "$README"; then
+                    ok "Папка Korzun_team успешно прошла проверку на состав (2 человека) и уровень JUNIOR."
+                  else
+                    err "Для Korzun_team в README.md должен быть явно указан «Уровень: JUNIOR»."
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          # 4. Умная проверка сопутствующих документов .md (Контроль заполнения шаблонов)
+          for doc in design-system.md components.md handoff.md; do
+            target_doc="$DIR/$doc"
+            if [ ! -f "$target_doc" ]; then
+              err "Файл документации $target_doc отсутствует."
+            else
+              # Проверяем, изменялся ли файл вообще относительно оригинального репозитория
+              if ! git diff --quiet "origin/${BASE_REF}...HEAD" -- "$target_doc"; then
+                # Проверяем, что студенты вычистили маркеры заполнителей преподавателя
+                if grep -qE 'XXXXXX|\[Участник|\[Имя Фамилия|\[Вставьте|\[Укажите' "$target_doc"; then
+                  err "Файл $target_doc содержит незаполненные шаблонные маркеры (например, XXXXXX или скобки [...])."
+                else
+                  ok "Документ $doc успешно изменен и заполнен командой."
+                fi
+              else
+                err "Файл $target_doc не изменялся! Студенты просто скопировали пустой шаблон преподавателя."
+              fi
+            fi
+          done
+
+          # 5. Проверка графических экспортов
+          has_export() {
+            local base_name="$1"
+            local count
+            count=$(find "$DIR/exports" -maxdepth 1 -type f \
+              \( -iname "$base_name.png" -o -iname "$base_name.jpg" -o -iname "$base_name.jpeg" -o -iname "$base_name.webp" -o -iname "$base_name.avif" -o -iname "$base_name.svg" \) 2>/dev/null | wc -l)
+            [ "$count" -ge 1 ]
+          }
+
+          if [ ! -d "$DIR/exports" ]; then
+            err "В папке команды не найдена обязательная директория exports/"
+          else
+            if [[ "$DIR" == "Korzun_team" ]]; then
+              for asset in desktop mobile; do
+                if has_export "$asset"; then ok "Экспорт найден: exports/$asset.*"; else err "В exports/ отсутствует файл $asset.(png|jpg|webp|svg)"; fi
+              done
+            elif [[ "$DIR" == "Yarahovich_team" ]]; then
+              for asset in desktop mobile tablet stress-test-before stress-test-after; do
+                if has_export "$asset"; then ok "Экспорт найден: exports/$asset.*"; else err "В exports/ отсутствует обязательный файл $asset.(png|jpg|webp|avif)"; fi
+              done
+            fi
+          fi
+
+          # 6. Запрет на загрузку исходников .fig и скриптов + лимит на вес
+          for f in "${changed_files[@]}"; do
+            [[ "$f" == .github/* ]] && continue
+            lower_file="${f,,}"
+            if [[ "$lower_file" =~ \.(sh|bash|exe|bat|cmd|py|js|fig)$ ]]; then
+              err "Запрещено загружать исполняемые файлы или исходники Figma: $f. Макет сдается только ссылкой."
+            fi
+            if [ -f "$f" ] && [ "$(stat -c %s -- "$f")" -gt "$MAX_SIZE_BYTES" ]; then
+              err "Файл $f превышает допустимый лимит в 5 МБ. Оптимизируйте графику."
+            fi
+          done
+
+          # Запись результатов работы скрипта в Summary
+          echo "## Результаты проверки структуры Figma-практики" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s' "$report" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::Автоматическая проверка выявила ошибки в структуре или контенте ($errors шт)."
+            exit 1
+          fi
+          echo "Все тесты структуры и заполнения шаблонов пройдены! 🎉"
