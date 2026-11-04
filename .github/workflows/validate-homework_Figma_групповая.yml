@@ -39,6 +39,7 @@ jobs:
 
           errors=0
           report=""
+          LEVEL="JUNIOR" # Дефолтное значение
 
           err() { errors=$((errors+1)); echo "::error::$1"; report+="❌ $1"$'\n'; }
           ok()  { echo "✅ $1"; report+="✅ $1"$'\n'; }
@@ -107,26 +108,31 @@ jobs:
               
               ok "Количество зафиксированных студентов в команде: $team_size"
 
-              # Валидация связки "Папка — Состав — Командный уровень"
+              # Динамическое определение целевого уровня из README
+              if grep -q "Уровень:.*PRO" "$README"; then
+                LEVEL="PRO"
+                ok "Команда заявила повышенный уровень: PRO."
+              elif grep -q "Уровень:.*JUNIOR" "$README"; then
+                LEVEL="JUNIOR"
+                ok "Команда заявила стандартный уровень: JUNIOR."
+              else
+                err "В README.md не найден или некорректно указан уровень (должно быть 'Уровень: JUNIOR' или 'Уровень: PRO')."
+              fi
+
+              # Валидация ограничений по составу на основе ПАПКИ и выбранного УРОВНЯ
               if [[ "$DIR" == "Yarahovich_team" ]]; then
                 if [ "$team_size" -ne 3 ]; then
-                  err "Для Yarahovich_team (уровень PRO) в команде должно быть ровно 3 человека. Найдено: $team_size."
-                else
-                  if grep -q "Уровень:.*PRO" "$README"; then
-                    ok "Папка Yarahovich_team успешно прошла проверку на состав (3 человека) и уровень PRO."
-                  else
-                    err "Для Yarahovich_team в README.md должен быть явно указан «Уровень: PRO»."
-                  fi
+                  err "Для Yarahovich_team в команде должно быть ровно 3 человека. Найдено: $team_size."
+                fi
+                if [ "$LEVEL" != "PRO" ]; then
+                  err "Папка Yarahovich_team зарезервирована строго под уровень PRO. Заявленный уровень '$LEVEL' недопустим."
                 fi
               elif [[ "$DIR" == "Korzun_team" ]]; then
-                if [ "$team_size" -ne 2 ]; then
-                  err "Для Korzun_team (уровень JUNIOR) в команде должно быть ровно 2 человека. Найдено: $team_size."
-                else
-                  if grep -q "Уровень:.*JUNIOR" "$README"; then
-                    ok "Папка Korzun_team успешно прошла проверку на состав (2 человека) и уровень JUNIOR."
-                  else
-                    err "Для Korzun_team в README.md должен быть явно указан «Уровень: JUNIOR»."
-                  fi
+                if [ "$LEVEL" == "JUNIOR" ] && [ "$team_size" -ne 2 ]; then
+                  err "Для уровня JUNIOR в команде Korzun_team должно быть ровно 2 человека. Найдено: $team_size."
+                fi
+                if [ "$LEVEL" == "PRO" ]; then
+                  ok "⚠️ Инициатива одобрена: Команда Korzun_team (состав: $team_size чел.) переключена в режим валидации PRO!"
                 fi
               fi
             fi
@@ -138,9 +144,9 @@ jobs:
             if [ ! -f "$target_doc" ]; then
               err "Файл документации $target_doc отсутствует."
             else
-              # Проверяем, изменялся ли файл вообще относительно оригинального репозитория
+              # Проверяем, изменялся ли файл вообще относительно оригинального репозитория преподавателя
               if ! git diff --quiet "origin/${BASE_REF}...HEAD" -- "$target_doc"; then
-                # Проверяем, что студенты вычистили маркеры заполнителей преподавателя
+                # Проверяем, что студенты вычистили маркеры заполнителей
                 if grep -qE 'XXXXXX|\[Участник|\[Имя Фамилия|\[Вставьте|\[Укажите' "$target_doc"; then
                   err "Файл $target_doc содержит незаполненные шаблонные маркеры (например, XXXXXX или скобки [...])."
                 else
@@ -152,7 +158,7 @@ jobs:
             fi
           done
 
-          # 5. Проверка графических экспортов
+          # 5. Проверка графических экспортов на основе определенного LEVEL
           has_export() {
             local base_name="$1"
             local count
@@ -164,13 +170,13 @@ jobs:
           if [ ! -d "$DIR/exports" ]; then
             err "В папке команды не найдена обязательная директория exports/"
           else
-            if [[ "$DIR" == "Korzun_team" ]]; then
+            if [[ "$LEVEL" == "JUNIOR" ]]; then
               for asset in desktop mobile; do
                 if has_export "$asset"; then ok "Экспорт найден: exports/$asset.*"; else err "В exports/ отсутствует файл $asset.(png|jpg|webp|svg)"; fi
               done
-            elif [[ "$DIR" == "Yarahovich_team" ]]; then
+            elif [[ "$LEVEL" == "PRO" ]]; then
               for asset in desktop mobile tablet stress-test-before stress-test-after; do
-                if has_export "$asset"; then ok "Экспорт найден: exports/$asset.*"; else err "В exports/ отсутствует обязательный файл $asset.(png|jpg|webp|avif)"; fi
+                if has_export "$asset"; then ok "Экспорт найден: exports/$asset.*"; else err "В exports/ отсутствует обязательный файл $asset.(png|jpg|webp|avif) для уровня PRO"; fi
               done
             fi
           fi
@@ -183,7 +189,7 @@ jobs:
               err "Запрещено загружать исполняемые файлы или исходники Figma: $f. Макет сдается только ссылкой."
             fi
             if [ -f "$f" ] && [ "$(stat -c %s -- "$f")" -gt "$MAX_SIZE_BYTES" ]; then
-              err "Файл $f превышает допустимый лимит в 5 МБ. Оптимизируйте графику."
+              err "Файл $f превышает допустимый лимит в 5 МБ. Оптимизируйте графику перед коммитом."
             fi
           done
 
